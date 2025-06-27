@@ -1,0 +1,61 @@
+version: "2"
+
+run:
+  issues-exit-code: 1
+  tests: false
+
+linters:
+  enable:
+    - dupl
+    - funlen
+    - gocognit
+    - gocritic
+    - gocyclo
+    - gosec
+    - lll
+    - nakedret
+    - prealloc
+    - unconvert
+    - unparam
+  settings:
+    dupl:
+      threshold: 400
+    funlen:
+      lines: 85
+      statements: 50
+    staticcheck:
+      checks:
+        - none
+        # EXCLUDE: Omit embedded fields from selector expression.
+        # https://staticcheck.dev/docs/checks/#QF1008
+        - '-QF1008'
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - "^cmd/.*?"
+      - "^internal/build"
+      - ".*\\.md$"
+      - "\\.gitignore$"
+      - "\\.aidigestignore$"
+      - "\\.env$"
+      - "^Makefile$"
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

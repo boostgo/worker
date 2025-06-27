@@ -3,17 +3,22 @@ package worker
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
+
+	"github.com/boostgo/appx"
+	"github.com/boostgo/errorx"
+	"github.com/boostgo/log"
+	"github.com/boostgo/trace"
 )
 
-type Action func(ctx context.Context, stop func()) error
+type (
+	Action     func(ctx context.Context) error
+	Middleware func(ctx context.Context) error
+)
 
 // Worker is job/cron based structure.
 type Worker struct {
-	ctx      context.Context
-	teardown func(fn func() error)
-
+	teardown     func(fn func() error)
 	name         string
 	fromStart    bool
 	duration     time.Duration
@@ -22,24 +27,29 @@ type Worker struct {
 	stopper      chan struct{}
 	done         chan struct{}
 	timeout      time.Duration
+	amIMaster    bool
+
+	beforeMiddlewares []Middleware
+	afterMiddlewares  []Middleware
 }
 
-// New creates [Worker] object
-func New(
-	ctx context.Context,
+// NewWorker creates [Worker] object
+func NewWorker(
 	name string,
 	duration time.Duration,
 	action Action,
 ) *Worker {
 	return &Worker{
-		ctx:      ctx,
-		teardown: func(fn func() error) {},
+		teardown:  func(fn func() error) {},
+		name:      name,
+		duration:  duration,
+		action:    action,
+		stopper:   make(chan struct{}, 1),
+		done:      make(chan struct{}, 1),
+		amIMaster: trace.AmIMaster(),
 
-		name:     name,
-		duration: duration,
-		action:   action,
-		stopper:  make(chan struct{}, 1),
-		done:     make(chan struct{}, 1),
+		beforeMiddlewares: []Middleware{},
+		afterMiddlewares:  []Middleware{},
 	}
 }
 
@@ -71,21 +81,89 @@ func (worker *Worker) ErrorHandler(handler func(error) bool) *Worker {
 	return worker
 }
 
+func (worker *Worker) BeforeMiddlewares(middlewares ...Middleware) *Worker {
+	if len(middlewares) == 0 {
+		return worker
+	}
+
+	worker.beforeMiddlewares = append(worker.beforeMiddlewares, middlewares...)
+	return worker
+}
+
+func (worker *Worker) AfterMiddlewares(middlewares ...Middleware) *Worker {
+	if len(middlewares) == 0 {
+		return worker
+	}
+
+	worker.afterMiddlewares = append(worker.afterMiddlewares, middlewares...)
+	return worker
+}
+
 // runAction runs provided action with context and try function and trace id.
 func (worker *Worker) runAction() error {
 	ctx := context.Background()
 	var cancel context.CancelFunc
 
-	if worker.duration > 0 {
-		ctx, cancel = context.WithTimeout(ctx, worker.duration)
+	if worker.amIMaster {
+		ctx = trace.Set(ctx)
+	}
+
+	if worker.timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, worker.timeout+time.Second)
 		defer cancel()
 	}
 
-	return try(ctx, func(ctx context.Context) error {
-		return worker.action(ctx, func() {
-			worker.stopper <- struct{}{}
-		})
-	})
+	if err := errorx.TryContext(ctx, func(ctx context.Context) error {
+		var locked bool
+		for _, middleware := range worker.beforeMiddlewares {
+			if locked {
+				break
+			}
+
+			if err := middleware(ctx); err != nil {
+				if errors.Is(err, ErrLocked) {
+					locked = true
+					continue
+				}
+
+				log.
+					Error().
+					Ctx(ctx).
+					Err(err).
+					Msg("Worker before middleware")
+			}
+		}
+
+		defer func() {
+			if locked {
+				return
+			}
+
+			for _, middleware := range worker.afterMiddlewares {
+				if err := middleware(ctx); err != nil {
+					log.
+						Error().
+						Ctx(ctx).
+						Err(err).
+						Msg("Worker after middleware")
+				}
+			}
+		}()
+
+		if locked {
+			return nil
+		}
+
+		return worker.action(ctx)
+	}); err != nil {
+		log.
+			Namespace(worker.name).
+			Error().
+			Err(err).
+			Msg("Worker action failed")
+	}
+
+	return nil
 }
 
 // Run runs worker with provided duration
@@ -112,7 +190,7 @@ func (worker *Worker) Run() {
 
 		for {
 			select {
-			case <-worker.ctx.Done():
+			case <-appx.Context().Done():
 				worker.done <- struct{}{}
 				return
 			case <-worker.stopper:
@@ -134,25 +212,14 @@ func (worker *Worker) Run() {
 
 // Run created worker object and runs by itself. It is like "short" version of using [Worker]
 func Run(
-	ctx context.Context,
 	name string,
 	duration time.Duration,
 	action Action,
 	fromStart ...bool,
 ) {
-	worker := New(ctx, name, duration, action)
+	worker := NewWorker(name, duration, action)
 	if len(fromStart) > 0 {
 		worker.FromStart(fromStart[0])
 	}
 	worker.Run()
-}
-
-func try(ctx context.Context, fn func(ctx context.Context) error) (err error) {
-	defer func() {
-		if err == nil {
-			err = errors.New(fmt.Sprintf("%v", recover()))
-		}
-	}()
-
-	return fn(ctx)
 }
